@@ -1,0 +1,12 @@
+[package]
+name = "email-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+im = { version="15.1.0" ,features = ["serde"]}
+thiserror = "2.0.12"
+log = "0.4.27"
+flexi_logger = "0.31.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_yml = "0.0.12"
