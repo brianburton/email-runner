@@ -23,6 +23,8 @@ enum AppError {
     Usage,
     #[error("Error reading config file {0}: {1}")]
     ConfigFileError(String, #[source] Box<dyn Error>),
+    #[error("Error expanding env vars {0}")]
+    ConfigStringError(#[source] shellexpand::LookupError<env::VarError>),
     #[error("Error configuring logging: {0}")]
     LoggingSetupFailed(FlexiLoggerError),
     #[error("Error running email sync program {0}: {1}")]
@@ -61,9 +63,28 @@ struct AppConfig {
     log_dir: String,
 }
 
+fn expand(s: &str) -> Result<String, AppError> {
+    shellexpand::full(&s)
+        .map_err(AppError::ConfigStringError)
+        .map(|v| v.to_string())
+}
+
+fn expand_all(v: &Vector<String>) -> Result<Vector<String>, AppError> {
+    v.iter().map(|v| expand(v)).collect()
+}
+
 impl MailboxConfig {
     fn summary(&self) -> String {
         format!("{} {:?}", self.program, self.args)
+    }
+
+    fn expand(&self) -> Result<MailboxConfig, AppError> {
+        let expanded = MailboxConfig {
+            program: expand(&self.program)?,
+            args: expand_all(&self.args)?,
+            interval_minutes: self.interval_minutes,
+        };
+        Ok(expanded)
     }
 }
 
@@ -71,8 +92,31 @@ impl EmailClientConfig {
     fn summary(&self) -> String {
         format!("{} {:?}", self.program, self.args)
     }
+
+    fn expand(&self) -> Result<EmailClientConfig, AppError> {
+        let expanded = EmailClientConfig {
+            program: expand(&self.program)?,
+            args: expand_all(&self.args)?,
+        };
+        Ok(expanded)
+    }
 }
 
+impl AppConfig {
+    fn expand(&self) -> Result<AppConfig, AppError> {
+        let mailboxes = self
+            .mailboxes
+            .iter()
+            .map(|m| m.expand())
+            .collect::<Result<Vector<_>, _>>()?;
+        let expanded = AppConfig {
+            client: self.client.expand()?,
+            mailboxes,
+            log_dir: expand(&self.log_dir)?,
+        };
+        Ok(expanded)
+    }
+}
 fn run_sync(config: &MailboxConfig) -> Result<(), AppError> {
     let rc = Command::new(&config.program)
         .args(&config.args)
@@ -169,8 +213,12 @@ fn read_config(path: &str) -> Result<AppConfig, Box<dyn Error>> {
 
 fn main() -> Result<(), AppError> {
     let config_file = env::args().nth(1).ok_or(AppError::Usage)?;
-    let config =
-        read_config(&config_file).map_err(|e| AppError::ConfigFileError(config_file, e))?;
+    let config = read_config(&config_file)
+        .map_err(|e| AppError::ConfigFileError(config_file, e))?
+        .expand()?;
+    if !std::path::Path::new(&config.log_dir).exists() {
+        return Err(AppError::Usage);
+    }
     Logger::try_with_str("info")
         .unwrap()
         .log_to_file(FileSpec::default().directory(config.log_dir))
