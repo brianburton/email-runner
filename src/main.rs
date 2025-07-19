@@ -253,44 +253,7 @@ fn read_config(path: &str) -> Result<AppConfig, Box<dyn Error>> {
     Ok(config)
 }
 
-fn main() -> Result<(), AppError> {
-    let config_file = env::args().nth(1).ok_or(AppError::Usage)?;
-    let config = read_config(&config_file)
-        .map_err(|e| AppError::ConfigFileError(config_file, e))?
-        .expand()?;
-    if !std::path::Path::new(&config.log_dir).exists() {
-        return Err(AppError::Usage);
-    }
-    Logger::try_with_str("info")
-        .unwrap()
-        .log_to_file(FileSpec::default().directory(config.log_dir))
-        .rotate(
-            Criterion::Age(Age::Day),
-            Naming::Timestamps,
-            Cleanup::KeepLogFiles(7),
-        )
-        .format(opt_format)
-        .start()
-        .map_err(AppError::LoggingSetupFailed)?;
-    let mut sync_threads = config
-        .mailboxes
-        .iter()
-        .map(spawn_sync_thread)
-        .collect::<Vec<Result<SyncThreadControl, AppError>>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, AppError>>()?;
-    let senders = sync_threads.iter().map(|sc| sc.channel.clone()).collect();
-    let force_channel = spawn_force_sync_thread(config.force_sync_path, senders)?;
-    sync_threads.push(force_channel);
-    let client_result = run_email_client(&config.client);
-    sync_threads
-        .iter()
-        .map(|sc| {
-            sc.channel
-                .send(false)
-                .map_err(|e| AppError::SyncChannelError(config.client.summary(), e))
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
+fn join_threads(config: AppConfig, sync_threads: Vec<SyncThreadControl>) -> Result<(), AppError> {
     sync_threads
         .into_iter()
         .map(|sc| {
@@ -299,5 +262,76 @@ fn main() -> Result<(), AppError> {
                 .map_err(|_| AppError::SyncJoinError(config.client.summary()))
         })
         .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(())
+}
+
+fn stop_threads(
+    config: &AppConfig,
+    sync_threads: &mut Vec<SyncThreadControl>,
+) -> Result<(), AppError> {
+    sync_threads
+        .iter()
+        .map(|sc| {
+            sc.channel
+                .send(false)
+                .map_err(|e| AppError::SyncChannelError(config.client.summary(), e))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(())
+}
+
+fn start_force_sync_thread(
+    config: &AppConfig,
+    sync_threads: &[SyncThreadControl],
+) -> Result<SyncThreadControl, AppError> {
+    let senders = sync_threads.iter().map(|sc| sc.channel.clone()).collect();
+    let force_sync_thread = spawn_force_sync_thread(config.force_sync_path.to_string(), senders)?;
+    Ok(force_sync_thread)
+}
+
+fn start_sync_threads(config: &AppConfig) -> Result<Vec<SyncThreadControl>, AppError> {
+    config
+        .mailboxes
+        .iter()
+        .map(spawn_sync_thread)
+        .collect::<Vec<Result<SyncThreadControl, AppError>>>()
+        .into_iter()
+        .collect::<Result<Vec<_>, AppError>>()
+}
+
+fn set_up_logging(config: &AppConfig) -> Result<(), AppError> {
+    if !std::path::Path::new(&config.log_dir).exists() {
+        return Err(AppError::Usage);
+    }
+    let log_dir_spec = FileSpec::default().directory(config.log_dir.as_str());
+    Logger::try_with_str("info")
+        .unwrap()
+        .log_to_file(log_dir_spec)
+        .rotate(
+            Criterion::Age(Age::Day),
+            Naming::Timestamps,
+            Cleanup::KeepLogFiles(7),
+        )
+        .format(opt_format)
+        .start()
+        .map_err(AppError::LoggingSetupFailed)?;
+    Ok(())
+}
+
+fn main() -> Result<(), AppError> {
+    let config_file = env::args().nth(1).ok_or(AppError::Usage)?;
+    let config = read_config(&config_file)
+        .map_err(|e| AppError::ConfigFileError(config_file, e))?
+        .expand()?;
+    set_up_logging(&config)?;
+
+    let mut sync_threads = start_sync_threads(&config)?;
+    let force_sync_thread = start_force_sync_thread(&config, &sync_threads)?;
+    sync_threads.push(force_sync_thread);
+
+    let client_result = run_email_client(&config.client);
+
+    stop_threads(&config, &mut sync_threads)?;
+    join_threads(config, sync_threads)?;
     client_result
 }
