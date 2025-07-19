@@ -4,7 +4,6 @@ use flexi_logger::{
 use im::Vector;
 use log::{error, info};
 use serde::Deserialize;
-use std::cmp;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
@@ -14,6 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use std::{cmp, fs};
 use std::{env, io};
 use thiserror::Error;
 
@@ -61,6 +61,7 @@ struct AppConfig {
     client: EmailClientConfig,
     mailboxes: Vector<MailboxConfig>,
     log_dir: String,
+    force_sync_path: String,
 }
 
 fn expand(s: &str) -> Result<String, AppError> {
@@ -113,6 +114,7 @@ impl AppConfig {
             client: self.client.expand()?,
             mailboxes,
             log_dir: expand(&self.log_dir)?,
+            force_sync_path: expand(&self.force_sync_path)?,
         };
         Ok(expanded)
     }
@@ -186,6 +188,46 @@ fn spawn_sync_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppErr
     })
 }
 
+fn spawn_force_sync_thread(
+    sync_file_path: String,
+    sync_thread_channels: Vec<mpsc::Sender<bool>>,
+) -> Result<SyncThreadControl, AppError> {
+    let (send, recv) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        info!("Force sync thread {} started", &sync_file_path);
+        let timeout_duration = Duration::from_millis(100);
+        loop {
+            let sync_file = std::path::Path::new(sync_file_path.as_str());
+            let sync_needed = sync_file.exists()
+                || match recv.recv_timeout(timeout_duration) {
+                    Ok(true) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Ok(false) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+            if sync_needed {
+                info!("Force sync requested");
+                let rc = sync_thread_channels
+                    .iter()
+                    .map(|channel| channel.send(true))
+                    .collect::<Result<Vec<_>, _>>();
+                if let Err(err) = rc {
+                    error!("Force sync returned error: {err}");
+                }
+                let rc = fs::remove_file(sync_file_path.as_str());
+                if let Err(err) = rc {
+                    error!("Force sync unable to remove {sync_file_path}: {err}");
+                }
+            }
+        }
+        info!("Force sync stopped");
+    });
+    Ok(SyncThreadControl {
+        handle,
+        channel: send,
+    })
+}
+
 fn run_email_client(config: &EmailClientConfig) -> Result<(), AppError> {
     info!("Email client {} started", config.summary());
     let status = Command::new(&config.program)
@@ -230,13 +272,16 @@ fn main() -> Result<(), AppError> {
         .format(opt_format)
         .start()
         .map_err(AppError::LoggingSetupFailed)?;
-    let sync_threads = config
+    let mut sync_threads = config
         .mailboxes
         .iter()
         .map(spawn_sync_thread)
         .collect::<Vec<Result<SyncThreadControl, AppError>>>()
         .into_iter()
         .collect::<Result<Vec<_>, AppError>>()?;
+    let senders = sync_threads.iter().map(|sc| sc.channel.clone()).collect();
+    let force_channel = spawn_force_sync_thread(config.force_sync_path, senders)?;
+    sync_threads.push(force_channel);
     let client_result = run_email_client(&config.client);
     sync_threads
         .iter()
