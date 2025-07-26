@@ -39,15 +39,27 @@ enum AppError {
     #[error("Bad status from email client program {0}: {1}")]
     ClientBadExitStatus(String, ExitStatus),
     #[error("Error running email client program {0}: {1}")]
-    SyncChannelError(String, #[source] mpsc::SendError<bool>),
+    SyncChannelError(String, #[source] mpsc::SendError<SyncCommand>),
     #[error("Error running joining client program {0}")]
     SyncJoinError(String),
 }
 
+#[derive(Copy, Clone)]
 enum SyncCommand {
     Update,
     Idle,
     Stop,
+}
+
+#[derive(Clone)]
+struct SyncThreadSender {
+    thread_name: String,
+    channel: mpsc::Sender<SyncCommand>,
+}
+
+struct SyncThreadControl {
+    handle: JoinHandle<()>,
+    sender: SyncThreadSender,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -155,19 +167,8 @@ fn run_sync(config: &MailboxConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct SyncThreadSender {
-    thread_name: String,
-    channel: mpsc::Sender<bool>,
-}
-
-struct SyncThreadControl {
-    handle: JoinHandle<()>,
-    sender: SyncThreadSender,
-}
-
 fn read_sync_command(
-    channel: &Receiver<bool>,
+    channel: &Receiver<SyncCommand>,
     timeout_duration: Duration,
     sync_needed: bool,
 ) -> SyncCommand {
@@ -175,9 +176,8 @@ fn read_sync_command(
         SyncCommand::Update
     } else {
         match channel.recv_timeout(timeout_duration) {
-            Ok(true) => SyncCommand::Update,
+            Ok(command) => command,
             Err(mpsc::RecvTimeoutError::Timeout) => SyncCommand::Idle,
-            Ok(false) => SyncCommand::Stop,
             Err(mpsc::RecvTimeoutError::Disconnected) => SyncCommand::Stop,
         }
     }
@@ -185,7 +185,7 @@ fn read_sync_command(
 
 fn send_to_sync_channels(
     sync_thread_channels: &[SyncThreadSender],
-    value_to_send: bool,
+    value_to_send: SyncCommand,
 ) -> Result<(), AppError> {
     sync_thread_channels
         .iter()
@@ -243,18 +243,18 @@ fn spawn_force_sync_thread(
     let handle = thread::spawn(move || {
         info!("Force sync thread {} started", &sync_file_path);
         let timeout_duration = Duration::from_millis(100);
+        let sync_file = std::path::Path::new(sync_file_path.as_str());
         loop {
-            let sync_file = std::path::Path::new(sync_file_path.as_str());
             match read_sync_command(&recv, timeout_duration, sync_file.exists()) {
                 SyncCommand::Idle => (),
                 SyncCommand::Stop => break,
                 SyncCommand::Update => {
                     info!("Force sync requested");
-                    let rc = send_to_sync_channels(&senders, true);
+                    let rc = send_to_sync_channels(&senders, SyncCommand::Update);
                     if let Err(err) = rc {
                         error!("Force sync returned error: {err}");
                     }
-                    if let Err(err) = fs::remove_file(sync_file_path.as_str()) {
+                    if let Err(err) = fs::remove_file(&sync_file_path) {
                         error!("Force sync unable to remove {sync_file_path}: {err}");
                     }
                 }
@@ -309,12 +309,12 @@ fn join_threads(config: AppConfig, sync_threads: Vec<SyncThreadControl>) -> Resu
 }
 
 fn stop_threads(sync_threads: &[SyncThreadControl]) -> Result<(), AppError> {
-    log::info!("Stopping all threads");
+    info!("Stopping all threads");
     let senders = sync_threads
         .iter()
         .map(|c| c.sender.clone())
         .collect::<Vec<_>>();
-    send_to_sync_channels(&senders, false)
+    send_to_sync_channels(&senders, SyncCommand::Stop)
 }
 
 fn start_force_sync_thread(
