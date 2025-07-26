@@ -6,7 +6,7 @@ use log::{error, info};
 use serde::Deserialize;
 use std::error::Error;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::ops::Add;
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
@@ -24,8 +24,6 @@ enum AppError {
     Usage,
     #[error("Error reading config file {0}: {1}")]
     ConfigFileError(String, #[source] Box<dyn Error>),
-    #[error("Error expanding env vars {0}")]
-    ConfigStringError(#[source] shellexpand::LookupError<env::VarError>),
     #[error("Error configuring logging: {0}")]
     LoggingSetupFailed(FlexiLoggerError),
     #[error("Error running email sync program {0}: {1}")]
@@ -83,59 +81,15 @@ struct AppConfig {
     force_sync_path: String,
 }
 
-fn expand(s: &str) -> Result<String, AppError> {
-    shellexpand::full(&s)
-        .map_err(AppError::ConfigStringError)
-        .map(|v| v.to_string())
-}
-
-fn expand_all(v: &Vector<String>) -> Result<Vector<String>, AppError> {
-    v.iter().map(|v| expand(v)).collect()
-}
-
 impl MailboxConfig {
     fn summary(&self) -> String {
         format!("{} {:?}", self.program, self.args)
-    }
-
-    fn expand(&self) -> Result<MailboxConfig, AppError> {
-        let expanded = MailboxConfig {
-            program: expand(&self.program)?,
-            args: expand_all(&self.args)?,
-            interval_minutes: self.interval_minutes,
-        };
-        Ok(expanded)
     }
 }
 
 impl EmailClientConfig {
     fn summary(&self) -> String {
         format!("{} {:?}", self.program, self.args)
-    }
-
-    fn expand(&self) -> Result<EmailClientConfig, AppError> {
-        let expanded = EmailClientConfig {
-            program: expand(&self.program)?,
-            args: expand_all(&self.args)?,
-        };
-        Ok(expanded)
-    }
-}
-
-impl AppConfig {
-    fn expand(&self) -> Result<AppConfig, AppError> {
-        let mailboxes = self
-            .mailboxes
-            .iter()
-            .map(|m| m.expand())
-            .collect::<Result<Vector<_>, _>>()?;
-        let expanded = AppConfig {
-            client: self.client.expand()?,
-            mailboxes,
-            log_dir: expand(&self.log_dir)?,
-            force_sync_path: expand(&self.force_sync_path)?,
-        };
-        Ok(expanded)
     }
 }
 
@@ -290,9 +244,12 @@ fn run_email_client(config: &EmailClientConfig) -> Result<(), AppError> {
 }
 
 fn read_config(path: &str) -> Result<AppConfig, Box<dyn Error>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let config: AppConfig = serde_yml::from_reader(reader)?;
+    let mut raw_config_string = String::new();
+    let config_file = File::open(path)?;
+    BufReader::new(config_file).read_to_string(&mut raw_config_string)?;
+    raw_config_string = raw_config_string.replace("~", "${HOME}");
+    let expanded_config_string = shellexpand::full(&&raw_config_string).map(|v| v.to_string())?;
+    let config = serde_yml::from_str(&expanded_config_string)?;
     Ok(config)
 }
 
@@ -360,9 +317,8 @@ fn set_up_logging(config: &AppConfig) -> Result<(), AppError> {
 
 fn main() -> Result<(), AppError> {
     let config_file = env::args().nth(1).ok_or(AppError::Usage)?;
-    let config = read_config(&config_file)
-        .map_err(|e| AppError::ConfigFileError(config_file, e))?
-        .expand()?;
+    let config =
+        read_config(&config_file).map_err(|e| AppError::ConfigFileError(config_file, e))?;
     set_up_logging(&config)?;
 
     let mut sync_threads = start_sync_threads(&config)?;
