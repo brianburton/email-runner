@@ -163,8 +163,7 @@ fn spawn_sync_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppErr
         let interval_duration = Duration::from_secs(interval_seconds);
         let mut next_instant = Instant::now();
         loop {
-            let current_instant = Instant::now();
-            match read_sync_command(&recv, timeout_duration, current_instant >= next_instant) {
+            match read_sync_command(&recv, timeout_duration, Instant::now() >= next_instant) {
                 SyncCommand::Idle => (),
                 SyncCommand::Stop => break,
                 SyncCommand::Update => {
@@ -174,7 +173,7 @@ fn spawn_sync_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppErr
                     if let Err(err) = rc {
                         error!("Sync program {} returned error: {}", config.summary(), err);
                     }
-                    next_instant = current_instant.add(interval_duration);
+                    next_instant = Instant::now().add(interval_duration);
                 }
             }
         }
