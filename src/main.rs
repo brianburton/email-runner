@@ -9,8 +9,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::ops::Add;
 use std::process::{Command, ExitStatus};
+use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -93,7 +93,7 @@ impl EmailClientConfig {
     }
 }
 
-fn run_sync(config: &MailboxConfig) -> Result<(), AppError> {
+fn update_mailbox(config: &MailboxConfig) -> Result<(), AppError> {
     let rc = Command::new(&config.program)
         .args(&config.args)
         .output()
@@ -152,14 +152,17 @@ fn send_to_sync_channels(
         .map(|_| ())
 }
 
-fn spawn_generic_sync_thread<F1, F2>(
-    thread_name: &str,
-    mut pretest: F1,
-    mut update: F2,
+trait UpdateWorker {
+    fn update_needed(&self) -> bool;
+    fn update(&mut self);
+}
+
+fn spawn_update_worker_thread<U>(
+    thread_name: String,
+    mut worker: U,
 ) -> Result<SyncThreadControl, AppError>
 where
-    F1: FnMut() -> bool + Send + 'static,
-    F2: FnMut() + Send + 'static,
+    U: UpdateWorker + Send + 'static,
 {
     let moved_thread_name = thread_name.to_owned();
     let (send, recv) = mpsc::channel();
@@ -167,10 +170,10 @@ where
         info!("Sync thread {moved_thread_name} started");
         let timeout_duration = Duration::from_millis(100);
         loop {
-            match read_sync_command(&recv, timeout_duration, pretest()) {
+            match read_sync_command(&recv, timeout_duration, worker.update_needed()) {
                 SyncCommand::Idle => (),
                 SyncCommand::Stop => break,
-                SyncCommand::Update => update(),
+                SyncCommand::Update => worker.update(),
             }
         }
         info!("Sync thread {moved_thread_name} stopped");
@@ -178,61 +181,81 @@ where
     Ok(SyncThreadControl {
         handle,
         sender: SyncThreadSender {
-            thread_name: thread_name.to_owned(),
+            thread_name,
             channel: send,
         },
     })
 }
 
-fn spawn_sync_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppError> {
-    let interval_seconds = cmp::max(1, config.interval_minutes) * 60;
-    let interval_duration = Duration::from_secs(interval_seconds);
-    let next_instant = Arc::new(Mutex::new(Instant::now()));
-    let pretest = {
-        let next_instant = next_instant.clone();
-        move || Instant::now() >= *next_instant.lock().unwrap()
-    };
-
-    let thread_name = config.summary().to_owned();
-    let config = config.clone();
-    let update = {
-        let next_instant = next_instant.clone();
-        move || {
-            info!("Sync program {} started", config.summary());
-            let rc = run_sync(&config);
-            info!("Sync program {} stopped", config.summary());
-            if let Err(err) = rc {
-                error!("Sync program {} returned error: {}", config.summary(), err);
-            }
-            let mut next_instant = next_instant.lock().unwrap();
-            *next_instant = Instant::now().add(interval_duration);
-        }
-    };
-
-    spawn_generic_sync_thread(&thread_name, pretest, update)
+struct UpdateMailboxWorker {
+    config: MailboxConfig,
+    update_interval: Duration,
+    next_update_time: Instant,
 }
 
-fn spawn_force_sync_thread(
+impl UpdateWorker for UpdateMailboxWorker {
+    fn update_needed(&self) -> bool {
+        Instant::now() >= self.next_update_time
+    }
+
+    fn update(&mut self) {
+        info!("Sync program {} started", self.config.summary());
+        let rc = update_mailbox(&self.config);
+        if let Err(err) = rc {
+            error!(
+                "Sync program {} returned error: {}",
+                self.config.summary(),
+                err
+            );
+        }
+        self.next_update_time = Instant::now().add(self.update_interval);
+        info!("Sync program {} stopped", self.config.summary());
+    }
+}
+
+struct UpdateNowWorker {
     sync_file_path: String,
     senders: Vec<SyncThreadSender>,
-) -> Result<SyncThreadControl, AppError> {
-    let pretest = {
-        let sync_file_path = sync_file_path.clone();
-        move || fs::exists(&sync_file_path).ok().unwrap_or(false)
-    };
+}
 
-    let update = move || {
+impl UpdateWorker for UpdateNowWorker {
+    fn update_needed(&self) -> bool {
+        fs::exists(&self.sync_file_path).ok().unwrap_or(false)
+    }
+
+    fn update(&mut self) {
         info!("Force sync requested");
-        let rc = send_to_sync_channels(&senders, SyncCommand::Update);
+        let rc = send_to_sync_channels(&self.senders, SyncCommand::Update);
         if let Err(err) = rc {
             error!("Force sync returned error: {err}");
         }
-        if let Err(err) = fs::remove_file(&sync_file_path) {
-            error!("Force sync unable to remove {sync_file_path}: {err}");
+        if let Err(err) = fs::remove_file(&self.sync_file_path) {
+            error!("Force sync unable to remove {}: {err}", self.sync_file_path);
         }
-    };
+    }
+}
 
-    spawn_generic_sync_thread("force-sync-thread", pretest, update)
+fn spawn_update_mailbox_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppError> {
+    let thread_name = config.summary().to_owned();
+    let interval_seconds = cmp::max(1, config.interval_minutes) * 60;
+    let worker = UpdateMailboxWorker {
+        config: config.clone(),
+        update_interval: Duration::from_secs(interval_seconds),
+        next_update_time: Instant::now(),
+    };
+    spawn_update_worker_thread(thread_name, worker)
+}
+
+fn spawn_update_now_thread(
+    sync_file_path: String,
+    senders: Vec<SyncThreadSender>,
+) -> Result<SyncThreadControl, AppError> {
+    let thread_name = "force-sync-thread".to_owned();
+    let worker = UpdateNowWorker {
+        sync_file_path,
+        senders,
+    };
+    spawn_update_worker_thread(thread_name, worker)
 }
 
 fn run_email_client(config: &EmailClientConfig) -> Result<(), AppError> {
@@ -292,7 +315,7 @@ fn start_force_sync_thread(
         .iter()
         .map(|sc| sc.sender.clone())
         .collect::<Vec<_>>();
-    let force_sync_thread = spawn_force_sync_thread(config.force_sync_path.to_string(), senders)?;
+    let force_sync_thread = spawn_update_now_thread(config.force_sync_path.to_string(), senders)?;
     Ok(force_sync_thread)
 }
 
@@ -300,7 +323,7 @@ fn start_sync_threads(config: &AppConfig) -> Result<Vec<SyncThreadControl>, AppE
     config
         .mailboxes
         .iter()
-        .map(spawn_sync_thread)
+        .map(spawn_update_mailbox_thread)
         .collect::<Vec<Result<SyncThreadControl, AppError>>>()
         .into_iter()
         .collect::<Result<Vec<_>, AppError>>()
