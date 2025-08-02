@@ -81,6 +81,11 @@ struct AppConfig {
     force_sync_path: String,
 }
 
+trait UpdateWorker {
+    fn update_needed(&self) -> bool;
+    fn update(&mut self);
+}
+
 impl MailboxConfig {
     fn summary(&self) -> String {
         format!("{} {:?}", self.program, self.args)
@@ -150,11 +155,6 @@ fn send_to_sync_channels(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|_| ())
-}
-
-trait UpdateWorker {
-    fn update_needed(&self) -> bool;
-    fn update(&mut self);
 }
 
 fn spawn_update_worker_thread<U>(
@@ -315,8 +315,7 @@ fn start_force_sync_thread(
         .iter()
         .map(|sc| sc.sender.clone())
         .collect::<Vec<_>>();
-    let force_sync_thread = spawn_update_now_thread(config.force_sync_path.to_string(), senders)?;
-    Ok(force_sync_thread)
+    spawn_update_now_thread(config.force_sync_path.to_string(), senders)
 }
 
 fn start_sync_threads(config: &AppConfig) -> Result<Vec<SyncThreadControl>, AppError> {
