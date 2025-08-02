@@ -9,8 +9,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::ops::Add;
 use std::process::{Command, ExitStatus};
-use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -152,76 +152,87 @@ fn send_to_sync_channels(
         .map(|_| ())
 }
 
-fn spawn_sync_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppError> {
-    let orig_config = config;
-    let config = config.clone();
+fn spawn_generic_sync_thread<F1, F2>(
+    thread_name: &str,
+    mut pretest: F1,
+    mut update: F2,
+) -> Result<SyncThreadControl, AppError>
+where
+    F1: FnMut() -> bool + Send + 'static,
+    F2: FnMut() + Send + 'static,
+{
+    let moved_thread_name = thread_name.to_owned();
     let (send, recv) = mpsc::channel();
     let handle = thread::spawn(move || {
-        info!("Sync thread {} started", config.summary());
-        let interval_seconds = cmp::max(1, config.interval_minutes) * 60;
+        info!("Sync thread {moved_thread_name} started");
         let timeout_duration = Duration::from_millis(100);
-        let interval_duration = Duration::from_secs(interval_seconds);
-        let mut next_instant = Instant::now();
         loop {
-            match read_sync_command(&recv, timeout_duration, Instant::now() >= next_instant) {
+            match read_sync_command(&recv, timeout_duration, pretest()) {
                 SyncCommand::Idle => (),
                 SyncCommand::Stop => break,
-                SyncCommand::Update => {
-                    info!("Sync program {} started", config.summary());
-                    let rc = run_sync(&config);
-                    info!("Sync program {} stopped", config.summary());
-                    if let Err(err) = rc {
-                        error!("Sync program {} returned error: {}", config.summary(), err);
-                    }
-                    next_instant = Instant::now().add(interval_duration);
-                }
+                SyncCommand::Update => update(),
             }
         }
-        info!("Sync thread {} stopped", config.summary());
+        info!("Sync thread {moved_thread_name} stopped");
     });
     Ok(SyncThreadControl {
         handle,
         sender: SyncThreadSender {
-            thread_name: orig_config.summary(),
+            thread_name: thread_name.to_owned(),
             channel: send,
         },
     })
+}
+
+fn spawn_sync_thread(config: &MailboxConfig) -> Result<SyncThreadControl, AppError> {
+    let interval_seconds = cmp::max(1, config.interval_minutes) * 60;
+    let interval_duration = Duration::from_secs(interval_seconds);
+    let next_instant = Arc::new(Mutex::new(Instant::now()));
+    let pretest = {
+        let next_instant = next_instant.clone();
+        move || Instant::now() >= *next_instant.lock().unwrap()
+    };
+
+    let thread_name = config.summary().to_owned();
+    let config = config.clone();
+    let update = {
+        let next_instant = next_instant.clone();
+        move || {
+            info!("Sync program {} started", config.summary());
+            let rc = run_sync(&config);
+            info!("Sync program {} stopped", config.summary());
+            if let Err(err) = rc {
+                error!("Sync program {} returned error: {}", config.summary(), err);
+            }
+            let mut next_instant = next_instant.lock().unwrap();
+            *next_instant = Instant::now().add(interval_duration);
+        }
+    };
+
+    spawn_generic_sync_thread(&thread_name, pretest, update)
 }
 
 fn spawn_force_sync_thread(
     sync_file_path: String,
     senders: Vec<SyncThreadSender>,
 ) -> Result<SyncThreadControl, AppError> {
-    let (send, recv) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        info!("Force sync thread {} started", &sync_file_path);
-        let timeout_duration = Duration::from_millis(100);
-        let sync_file = std::path::Path::new(sync_file_path.as_str());
-        loop {
-            match read_sync_command(&recv, timeout_duration, sync_file.exists()) {
-                SyncCommand::Idle => (),
-                SyncCommand::Stop => break,
-                SyncCommand::Update => {
-                    info!("Force sync requested");
-                    let rc = send_to_sync_channels(&senders, SyncCommand::Update);
-                    if let Err(err) = rc {
-                        error!("Force sync returned error: {err}");
-                    }
-                    if let Err(err) = fs::remove_file(&sync_file_path) {
-                        error!("Force sync unable to remove {sync_file_path}: {err}");
-                    }
-                }
-            }
+    let pretest = {
+        let sync_file_path = sync_file_path.clone();
+        move || fs::exists(&sync_file_path).ok().unwrap_or(false)
+    };
+
+    let update = move || {
+        info!("Force sync requested");
+        let rc = send_to_sync_channels(&senders, SyncCommand::Update);
+        if let Err(err) = rc {
+            error!("Force sync returned error: {err}");
         }
-        info!("Force sync stopped");
-    });
-    Ok(SyncThreadControl {
-        handle,
-        sender: SyncThreadSender {
-            thread_name: "force-sync-thread".to_string(),
-            channel: send,
-        },
-    })
+        if let Err(err) = fs::remove_file(&sync_file_path) {
+            error!("Force sync unable to remove {sync_file_path}: {err}");
+        }
+    };
+
+    spawn_generic_sync_thread("force-sync-thread", pretest, update)
 }
 
 fn run_email_client(config: &EmailClientConfig) -> Result<(), AppError> {
