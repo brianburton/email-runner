@@ -120,10 +120,11 @@ fn update_mailbox(config: &MailboxConfig) -> Result<(), AppError> {
             stderr.trim_end()
         );
     }
-    if !rc.status.success() {
-        return Err(AppError::SyncBadExitStatus(config.summary(), rc.status));
+    if rc.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::SyncBadExitStatus(config.summary(), rc.status))
     }
-    Ok(())
 }
 
 fn read_sync_command(
