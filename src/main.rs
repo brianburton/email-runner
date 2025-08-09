@@ -2,13 +2,13 @@ use flexi_logger::{
     Age, Cleanup, Criterion, FileSpec, FlexiLoggerError, Logger, Naming, opt_format,
 };
 use im::Vector;
-use log::{error, info};
+use log::{error, info, warn};
 use serde::Deserialize;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::ops::Add;
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -98,33 +98,96 @@ impl EmailClientConfig {
     }
 }
 
+fn log_thread_output<R>(thread_name: &str, output_type: &str, input: Option<R>) -> JoinHandle<()>
+where
+    R: Read + Send + Sync + 'static,
+{
+    let prefix = format!("Sync {}: {}: ", thread_name, output_type);
+    thread::spawn(move || match input {
+        Some(input) => {
+            let reader = BufReader::new(input);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => info!("{prefix} {line}"),
+                    Err(e) => {
+                        error!("{prefix}: read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+        None => {
+            warn!("{prefix}: no input available");
+        }
+    })
+}
+
 fn update_mailbox(config: &MailboxConfig) -> Result<(), AppError> {
-    let rc = Command::new(&config.program)
+    info!("Sync {}: starting sync process", &config.summary());
+    let mut child = Command::new(&config.program)
         .args(&config.args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| AppError::SyncSpawnFailed(config.summary(), e))?;
-    let stdout = String::from_utf8_lossy(&rc.stdout);
-    let stderr = String::from_utf8_lossy(&rc.stderr);
-    info!("Sync {} complete: status: {}", config.summary(), rc.status);
-    if !stdout.is_empty() {
-        info!(
-            "Sync {} complete: stdout:\n{}",
-            config.summary(),
-            stdout.trim_end()
+
+    // Get handles to the stdout and stderr logger threads
+    let stdout_handle = log_thread_output(&config.summary(), "stdout", child.stdout.take());
+    let stderr_handle = log_thread_output(&config.summary(), "stderr", child.stderr.take());
+
+    // wait for process to complete before next interval
+    let wait_duration = Duration::from_millis(10);
+    let kill_duration = Duration::from_secs(60 * config.interval_minutes);
+    let kill_instant = Instant::now().add(kill_duration);
+    let mut rc = child.try_wait();
+    while let Ok(None) = rc
+        && Instant::now().lt(&kill_instant)
+    {
+        thread::sleep(wait_duration);
+        rc = child.try_wait();
+    }
+
+    // kill the process if timeout has been exceeded
+    if let Ok(None) = rc {
+        warn!(
+            "Sync {}: timed out, sending kill signal to process",
+            &config.summary()
         );
+        if let Err(e) = child.kill() {
+            warn!("Sync {}: kill signal send failed: {}", &config.summary(), e);
+        }
     }
-    if !stderr.is_empty() {
-        info!(
-            "Sync {} complete: stderr:\n{}",
-            config.summary(),
-            stderr.trim_end()
-        );
-    }
-    if rc.status.success() {
-        Ok(())
-    } else {
-        Err(AppError::SyncBadExitStatus(config.summary(), rc.status))
-    }
+
+    info!(
+        "Sync {}: waiting for stdout thread to stop",
+        &config.summary()
+    );
+    _ = stdout_handle.join();
+
+    info!(
+        "Sync {}: waiting for stderr thread to stop",
+        &config.summary()
+    );
+    _ = stderr_handle.join();
+
+    // wait for child process to exit and collect its status
+    let rc = match child.wait() {
+        Ok(exit_status) => {
+            info!(
+                "Sync {}: process exit status: {}",
+                config.summary(),
+                exit_status
+            );
+            if exit_status.success() {
+                Ok(())
+            } else {
+                Err(AppError::SyncBadExitStatus(config.summary(), exit_status))
+            }
+        }
+        Err(e) => Err(AppError::SyncSpawnFailed(config.summary(), e)),
+    };
+    info!("Sync {}: process shutdown complete", &config.summary());
+    rc
 }
 
 fn read_sync_command(
@@ -168,7 +231,7 @@ where
     let moved_thread_name = thread_name.to_owned();
     let (send, recv) = mpsc::channel();
     let handle = thread::spawn(move || {
-        info!("Sync thread {moved_thread_name} started");
+        info!("Sync {moved_thread_name}: thread started");
         let timeout_duration = Duration::from_millis(100);
         loop {
             match read_sync_command(&recv, timeout_duration, worker.update_needed()) {
@@ -177,7 +240,7 @@ where
                 SyncCommand::Update => worker.update(),
             }
         }
-        info!("Sync thread {moved_thread_name} stopped");
+        info!("Sync {moved_thread_name}: thread stopped");
     });
     Ok(SyncThreadControl {
         handle,
@@ -200,17 +263,17 @@ impl UpdateWorker for UpdateMailboxWorker {
     }
 
     fn update(&mut self) {
-        info!("Sync program {} started", self.config.summary());
+        info!("Sync {}: program started", self.config.summary());
         let rc = update_mailbox(&self.config);
         if let Err(err) = rc {
             error!(
-                "Sync program {} returned error: {}",
+                "Sync {}: program returned error: {}",
                 self.config.summary(),
                 err
             );
         }
         self.next_update_time = Instant::now().add(self.update_interval);
-        info!("Sync program {} stopped", self.config.summary());
+        info!("Sync {}: program stopped", self.config.summary());
     }
 }
 
